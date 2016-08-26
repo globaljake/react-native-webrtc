@@ -1,21 +1,19 @@
 'use strict';
 
-var EventTarget = require('event-target-shim');
-var React = require('react-native');
-var {
-  DeviceEventEmitter,
-  NativeModules,
-} = React;
-var WebRTCModule = NativeModules.WebRTCModule;
+import EventTarget from 'event-target-shim';
+import {DeviceEventEmitter, NativeModules} from 'react-native';
 
-var MediaStream = require('./MediaStream');
-var MediaStreamEvent = require('./MediaStreamEvent');
-var MediaStreamTrack = require('./MediaStreamTrack');
-var RTCDataChannel = require('./RTCDataChannel');
-var RTCSessionDescription = require('./RTCSessionDescription');
-var RTCIceCandidate = require('./RTCIceCandidate');
-var RTCIceCandidateEvent = require('./RTCIceCandidateEvent');
-var RTCEvent = require('./RTCEvent');
+import MediaStream from './MediaStream';
+import MediaStreamEvent from './MediaStreamEvent';
+import MediaStreamTrack from './MediaStreamTrack';
+import RTCDataChannel from './RTCDataChannel';
+import RTCDataChannelEvent from './RTCDataChannelEvent';
+import RTCSessionDescription from './RTCSessionDescription';
+import RTCIceCandidate from './RTCIceCandidate';
+import RTCIceCandidateEvent from './RTCIceCandidateEvent';
+import RTCEvent from './RTCEvent';
+
+const {WebRTCModule} = NativeModules;
 
 type RTCSignalingState =
   'stable' |
@@ -47,6 +45,8 @@ const PEER_CONNECTION_EVENTS = [
   'icegatheringstatechange',
   'negotiationneeded',
   'signalingstatechange',
+  // Peer-to-peer Data API:
+  'datachannel',
   // old:
   'addstream',
   'removestream',
@@ -54,7 +54,7 @@ const PEER_CONNECTION_EVENTS = [
 
 let nextPeerConnectionId = 0;
 
-class RTCPeerConnection extends EventTarget(PEER_CONNECTION_EVENTS) {
+export default class RTCPeerConnection extends EventTarget(PEER_CONNECTION_EVENTS) {
   localDescription: RTCSessionDescription;
   remoteDescription: RTCSessionDescription;
 
@@ -77,6 +77,11 @@ class RTCPeerConnection extends EventTarget(PEER_CONNECTION_EVENTS) {
   _remoteStreams: Array<MediaStream> = [];
   _subscriptions: Array<any>;
 
+  /**
+   * The RTCDataChannel.id allocator of this RTCPeerConnection.
+   */
+  _dataChannelIds: Set = new Set();
+
   constructor(configuration) {
     super();
     this._peerConnectionId = nextPeerConnectionId++;
@@ -95,7 +100,7 @@ class RTCPeerConnection extends EventTarget(PEER_CONNECTION_EVENTS) {
   createOffer(success: ?Function, failure: ?Function, constraints) {
     WebRTCModule.peerConnectionCreateOffer(this._peerConnectionId, (successful, data) => {
       if (successful) {
-        var sessionDescription = new RTCSessionDescription(data);
+        const sessionDescription = new RTCSessionDescription(data);
         success(sessionDescription);
       } else {
         failure(data); // TODO: convert to NavigatorUserMediaError
@@ -106,7 +111,7 @@ class RTCPeerConnection extends EventTarget(PEER_CONNECTION_EVENTS) {
   createAnswer(success: ?Function, failure: ?Function, constraints) {
     WebRTCModule.peerConnectionCreateAnswer(this._peerConnectionId, (successful, data) => {
       if (successful) {
-        var sessionDescription = new RTCSessionDescription(data);
+        const sessionDescription = new RTCSessionDescription(data);
         success(sessionDescription);
       } else {
         failure(data);
@@ -195,9 +200,9 @@ class RTCPeerConnection extends EventTarget(PEER_CONNECTION_EVENTS) {
         if (ev.id !== this._peerConnectionId) {
           return;
         }
-        var stream = new MediaStream(ev.streamId);
-        var tracks = ev.tracks;
-        for (var i = 0; i < tracks.length; i++) {
+        const stream = new MediaStream(ev.streamId);
+        const tracks = ev.tracks;
+        for (let i = 0; i < tracks.length; i++) {
           stream.addTrack(new MediaStreamTrack(tracks[i]));
         }
         this._remoteStreams.push(stream);
@@ -207,9 +212,9 @@ class RTCPeerConnection extends EventTarget(PEER_CONNECTION_EVENTS) {
         if (ev.id !== this._peerConnectionId) {
           return;
         }
-        var stream = this._remoteStreams.find(s => s.id === ev.streamId);
+        const stream = this._remoteStreams.find(s => s.id === ev.streamId);
         if (stream) {
-          var index = this._remoteStreams.indexOf(stream);
+          const index = this._remoteStreams.indexOf(stream);
           if (index > -1) {
             this._remoteStreams.splice(index, 1);
           }
@@ -220,8 +225,8 @@ class RTCPeerConnection extends EventTarget(PEER_CONNECTION_EVENTS) {
         if (ev.id !== this._peerConnectionId) {
           return;
         }
-        var candidate = new RTCIceCandidate(ev.candidate);
-        var event = new RTCIceCandidateEvent('icecandidate', {candidate});
+        const candidate = new RTCIceCandidate(ev.candidate);
+        const event = new RTCIceCandidateEvent('icecandidate', {candidate});
         this.dispatchEvent(event);
       }),
       DeviceEventEmitter.addListener('peerConnectionIceGatheringChanged', ev => {
@@ -229,13 +234,79 @@ class RTCPeerConnection extends EventTarget(PEER_CONNECTION_EVENTS) {
           return;
         }
         this.iceGatheringState = ev.iceGatheringState;
+
+        if (this.iceGatheringState === 'complete') {
+          this.dispatchEvent(new RTCIceCandidateEvent('icecandidate', null));
+        }
+
         this.dispatchEvent(new RTCEvent('icegatheringstatechange'));
+      }),
+      DeviceEventEmitter.addListener('peerConnectionDidOpenDataChannel', ev => {
+        if (ev.id !== this._peerConnectionId) {
+          return;
+        }
+        const evDataChannel = ev.dataChannel;
+        const id = evDataChannel.id;
+        // XXX RTP data channels are not defined by the WebRTC standard, have
+        // been deprecated in Chromium, and Google have decided (in 2015) to no
+        // longer support them (in the face of multiple reported issues of
+        // breakages).
+        if (typeof id !== 'number' || id === -1) {
+          return;
+        }
+        const channel = new RTCDataChannel(evDataChannel.label, evDataChannel);
+        // XXX webrtc::PeerConnection checked that id was not in use in its own
+        // SID allocator before it invoked us. Additionally, its own SID
+        // allocator is the authority on ResourceInUse. Consequently, it is
+        // (pretty) safe to update our RTCDataChannel.id allocator without
+        // checking for ResourceInUse.
+        this._dataChannelIds.add(id);
+        this.dispatchEvent(new RTCDataChannelEvent('datachannel', {channel}));
       })
     ];
   }
-  createDataChannel(label, options) {
-    return new RTCDataChannel(this._peerConnectionId, label, options);
+
+  /**
+   * Creates a new RTCDataChannel object with the given label. The
+   * RTCDataChannelInit dictionary can be used to configure properties of the
+   * underlying channel such as data reliability.
+   *
+   * @param {string} label - the value with which the label attribute of the new
+   * instance is to be initialized
+   * @param {RTCDataChannelInit} dataChannelDict - an optional dictionary of
+   * values with which to initialize corresponding attributes of the new
+   * instance such as id
+   */
+  createDataChannel(label: string, dataChannelDict?: ?RTCDataChannelInit) {
+    let id;
+    const dataChannelIds = this._dataChannelIds;
+    if (dataChannelDict && 'id' in dataChannelDict) {
+      id = dataChannelDict.id;
+      if (typeof id !== 'number') {
+        throw new TypeError('DataChannel id must be a number: ' + id);
+      }
+      if (dataChannelIds.has(id)) {
+        throw new ResourceInUse('DataChannel id already in use: ' + id);
+      }
+    } else {
+      // Allocate a new id.
+      // TODO Remembering the last used/allocated id and then incrementing it to
+      // generate the next id to use will surely be faster. However, I want to
+      // reuse ids (in the future) as the RTCDataChannel.id space is limited to
+      // unsigned short by the standard:
+      // https://www.w3.org/TR/webrtc/#dom-datachannel-id. Additionally, 65535
+      // is reserved due to SCTP INIT and INIT-ACK chunks only allowing a
+      // maximum of 65535 streams to be negotiated (as defined by the WebRTC
+      // Data Channel Establishment Protocol).
+      for (id = 0; id < 65535 && dataChannelIds.has(id); ++id);
+      // TODO Throw an error if no unused id is available.
+      dataChannelDict = Object.assign({id}, dataChannelDict);
+    }
+    WebRTCModule.createDataChannel(
+        this._peerConnectionId,
+        label,
+        dataChannelDict);
+    dataChannelIds.add(id);
+    return new RTCDataChannel(label, dataChannelDict);
   }
 }
-
-module.exports = RTCPeerConnection;
